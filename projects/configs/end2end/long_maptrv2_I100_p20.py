@@ -54,8 +54,8 @@ map_classes = ['divider', 'ped_crossing','boundary']
 # fixed_ptsnum_per_line = 20
 # map_classes = ['divider',]
 num_vec=50
-fixed_ptsnum_per_gt_line = 30 # now only support fixed_pts > 0
-fixed_ptsnum_per_pred_line = 30
+fixed_ptsnum_per_gt_line = 20 # now only support fixed_pts > 0
+fixed_ptsnum_per_pred_line = 20
 eval_use_same_gt_sample_num_flag=True
 num_map_classes = len(map_classes)
 
@@ -271,8 +271,8 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=4,
-    workers_per_gpu=2, # TODO
+    samples_per_gpu=2,
+    workers_per_gpu=4, # TODO
     train=dict(
         type=dataset_type,
         data_root=data_root,
