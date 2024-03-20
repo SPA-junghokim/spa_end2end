@@ -5,6 +5,7 @@ from .nuscenes_map_dataset import CustomNuScenesLocalMapDataset
 from .av2_map_dataset import CustomAV2LocalMapDataset
 from .nuscenes_offlinemap_dataset import CustomNuScenesOfflineLocalMapDataset
 from .av2_offlinemap_dataset import CustomAV2OfflineLocalMapDataset
+from .nuscenes_offlinemap_dataset_longrange import CustomNuScenesOfflineLocalMapDataset_Longrange
 __all__ = [
     'CustomNuScenesDataset','CustomNuScenesLocalMapDataset'
 ]

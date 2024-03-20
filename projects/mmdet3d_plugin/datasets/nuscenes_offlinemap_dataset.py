@@ -1,5 +1,5 @@
 import copy
-
+from functools import partial
 import numpy as np
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets import NuScenesDataset
@@ -14,7 +14,7 @@ from .nuscnes_eval import NuScenesEval_custom
 from projects.mmdet3d_plugin.models.utils.visual import save_tensor
 from mmcv.parallel import DataContainer as DC
 import random
-
+import prettytable
 from .nuscenes_dataset import CustomNuScenesDataset
 from nuscenes.map_expansion.map_api import NuScenesMap, NuScenesMapExplorer
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
@@ -23,6 +23,7 @@ from shapely.geometry import LineString, box, MultiPolygon, MultiLineString
 from mmdet.datasets.pipelines import to_tensor
 import json
 import cv2
+import math # TODO multi gpu
 
 def add_rotation_noise(extrinsics, std=0.01, mean=0.0):
     #n = extrinsics.shape[0]
@@ -84,6 +85,7 @@ class LiDARInstanceLines(object):
                  num_samples=250,
                  padding=False,
                  fixed_num=-1,
+                 Ext_fixed_num=-1,
                  padding_value=-10000,
                  patch_size=None):
         assert isinstance(instance_line_list, list)
@@ -97,10 +99,13 @@ class LiDARInstanceLines(object):
         self.num_samples = num_samples
         self.padding = padding
         self.fixed_num = fixed_num
+        self.Ext_fixed_num = Ext_fixed_num
         self.padding_value = padding_value
 
         self.instance_list = instance_line_list
         self.instance_labels = instance_labels
+        self.fixed_dist = 5                 # TODO 추가
+        self.padding_length = 36            # TODO 추가
 
     @property
     def start_end_points(self):
@@ -145,6 +150,47 @@ class LiDARInstanceLines(object):
         return instance_bbox_tensor
 
     @property
+    def bbox_condi(self):
+        """
+        return torch.Tensor([N,4]), in xmin, ymin, xmax, ymax form
+        """
+        assert len(self.instance_list) != 0
+        instance_bbox_list = []
+        for instance in self.instance_list:
+            if instance.length < 2:
+                continue
+            # bounds is bbox: [xmin, ymin, xmax, ymax]
+            instance_bbox_list.append(instance.bounds)
+        if len(instance_bbox_list) == 0:
+            for instance in self.instance_list:
+                instance_bbox_list.append(instance.bounds)
+        instance_bbox_array = np.array(instance_bbox_list)
+        instance_bbox_tensor = to_tensor(instance_bbox_array)
+        instance_bbox_tensor = instance_bbox_tensor.to(
+            dtype=torch.float32)
+        instance_bbox_tensor[:, 0] = torch.clamp(instance_bbox_tensor[:, 0], min=-self.max_x, max=self.max_x)
+        instance_bbox_tensor[:, 1] = torch.clamp(instance_bbox_tensor[:, 1], min=-self.max_y, max=self.max_y)
+        instance_bbox_tensor[:, 2] = torch.clamp(instance_bbox_tensor[:, 2], min=-self.max_x, max=self.max_x)
+        instance_bbox_tensor[:, 3] = torch.clamp(instance_bbox_tensor[:, 3], min=-self.max_y, max=self.max_y)
+        return instance_bbox_tensor
+
+    @property
+    def gt_labels(self):
+        instances_list = []
+        for idx, instance in enumerate(self.instance_list):
+            if instance.length < 2:
+                continue
+            instance_label = self.instance_labels[idx]
+            instances_list.append(instance_label)
+        if len(instances_list) == 0:
+            for idx, instance in enumerate(self.instance_list):
+                instance_label = self.instance_labels[idx]
+                instances_list.append(instance_label)
+        instance_bbox_array = np.array(instances_list)
+        instance_bbox_tensor = to_tensor(instance_bbox_array)
+        return instance_bbox_tensor
+
+    @property
     def fixed_num_sampled_points(self):
         """
         return torch.Tensor([N,fixed_num,2]), in xmin, ymin, xmax, ymax form
@@ -162,6 +208,183 @@ class LiDARInstanceLines(object):
                             dtype=torch.float32)
         instance_points_tensor[:,:,0] = torch.clamp(instance_points_tensor[:,:,0], min=-self.max_x,max=self.max_x)
         instance_points_tensor[:,:,1] = torch.clamp(instance_points_tensor[:,:,1], min=-self.max_y,max=self.max_y)
+        return instance_points_tensor
+
+    @property
+    def fixed_num_sampled_points_dou(self):
+        """
+        return torch.Tensor([N,fixed_num,2]), in xmin, ymin, xmax, ymax form
+            N means the num of instances
+        """
+        assert len(self.instance_list) != 0
+        instance_points_list = []
+        for instance in self.instance_list:
+            distances = np.linspace(0, instance.length, self.fixed_num*2)
+            sampled_points = np.array([list(instance.interpolate(distance).coords) for distance in distances]).reshape(
+                -1, 2)
+            instance_points_list.append(sampled_points)
+        instance_points_array = np.array(instance_points_list)
+        instance_points_tensor = to_tensor(instance_points_array)
+        instance_points_tensor = instance_points_tensor.to(
+            dtype=torch.float32)
+        instance_points_tensor[:, :, 0] = torch.clamp(instance_points_tensor[:, :, 0], min=-self.max_x, max=self.max_x)
+        instance_points_tensor[:, :, 1] = torch.clamp(instance_points_tensor[:, :, 1], min=-self.max_y, max=self.max_y)
+        return instance_points_tensor
+
+    @property
+    def Ext_fixed_num_sampled_points(self):
+        assert len(self.instance_list) != 0
+        instance_points_list = []
+        for instance in self.instance_list:
+            distances = np.linspace(0, instance.length, self.Ext_fixed_num)
+            sampled_points = np.array([list(instance.interpolate(distance).coords) for distance in distances]).reshape(
+                -1, 2)
+            instance_points_list.append(sampled_points)
+        instance_points_array = np.array(instance_points_list)
+        instance_points_tensor = to_tensor(instance_points_array)
+        instance_points_tensor = instance_points_tensor.to(
+            dtype=torch.float32)
+        instance_points_tensor[:, :, 0] = torch.clamp(instance_points_tensor[:, :, 0], min=-self.max_x, max=self.max_x)
+        instance_points_tensor[:, :, 1] = torch.clamp(instance_points_tensor[:, :, 1], min=-self.max_y, max=self.max_y)
+        return instance_points_tensor
+
+    @property
+    def Class_segemnts(self):
+        assert len(self.instance_list) != 0
+        self.canvas_size = [200, 100]
+        self.scale_x = self.canvas_size[1] / self.patch_size[1]
+        self.scale_y = self.canvas_size[0] / self.patch_size[0]
+        instance_points_list = []
+        gt_semantic_mask_0 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+        gt_semantic_mask_1 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+        gt_semantic_mask_2 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+
+        for idx, instance in enumerate(self.instance_list):
+            instance_label = self.instance_labels[idx]
+            if instance_label == 0:
+                self.line_ego_to_mask(instance, gt_semantic_mask_0[0], color=1, thickness=3)
+            elif instance_label == 1:
+                self.line_ego_to_mask(instance, gt_semantic_mask_1[0], color=1, thickness=3)
+            elif instance_label == 2:
+                self.line_ego_to_mask(instance, gt_semantic_mask_2[0], color=1, thickness=3)
+
+        gt_semantic_mask = np.concatenate([gt_semantic_mask_0.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])
+                        , gt_semantic_mask_1.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])
+                        , gt_semantic_mask_2.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])], 1)
+        
+        return to_tensor(gt_semantic_mask).float()
+
+    @property
+    def Class_segemnts_v2(self):
+        assert len(self.instance_list) != 0
+        self.canvas_size = [200, 100]
+        self.scale_x = self.canvas_size[1] / self.patch_size[1]
+        self.scale_y = self.canvas_size[0] / self.patch_size[0]
+        instance_points_list = []
+        gt_semantic_mask_0 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+        gt_semantic_mask_1 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+        gt_semantic_mask_2 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+
+        for idx, instance in enumerate(self.instance_list):
+            instance_label = self.instance_labels[idx]
+            if instance_label == 0:
+                self.line_ego_to_mask(instance, gt_semantic_mask_0[0], color=1, thickness=1)
+            elif instance_label == 1:
+                self.line_ego_to_mask(instance, gt_semantic_mask_1[0], color=1, thickness=1)
+            elif instance_label == 2:
+                self.line_ego_to_mask(instance, gt_semantic_mask_2[0], color=1, thickness=1)
+
+        gt_semantic_mask = np.concatenate([gt_semantic_mask_0.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])
+                                              ,
+                                           gt_semantic_mask_1.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])
+                                              ,
+                                           gt_semantic_mask_2.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])],
+                                          1)
+
+        return to_tensor(gt_semantic_mask).float()
+
+    @property
+    def Class_segemnts_v3(self):
+        assert len(self.instance_list) != 0
+        self.canvas_size = [200, 100]
+        self.scale_x = self.canvas_size[1] / self.patch_size[1]
+        self.scale_y = self.canvas_size[0] / self.patch_size[0]
+        instance_points_list = []
+        gt_semantic_mask_0 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+        gt_semantic_mask_1 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+        gt_semantic_mask_2 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+
+        for idx, instance in enumerate(self.instance_list):
+            instance_label = self.instance_labels[idx]
+            if instance_label == 0:
+                self.line_ego_to_mask(instance, gt_semantic_mask_0[0], color=1, thickness=5)
+            elif instance_label == 1:
+                self.line_ego_to_mask(instance, gt_semantic_mask_1[0], color=1, thickness=5)
+            elif instance_label == 2:
+                self.line_ego_to_mask(instance, gt_semantic_mask_2[0], color=1, thickness=5)
+
+        gt_semantic_mask = np.concatenate([gt_semantic_mask_0.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])
+                                              ,
+                                           gt_semantic_mask_1.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])
+                                              ,
+                                           gt_semantic_mask_2.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])],
+                                          1)
+
+        return to_tensor(gt_semantic_mask).float()
+
+    def line_ego_to_mask(self,
+                         line_ego,
+                         mask,
+                         color=1,
+                         thickness=3):
+        ''' Rasterize a single line to mask.
+
+        Args:
+            line_ego (LineString): line
+            mask (array): semantic mask to paint on
+            color (int): positive label, default: 1
+            thickness (int): thickness of rasterized lines, default: 3
+        '''
+        self.canvas_size = [200, 100]
+        trans_x = self.canvas_size[1] / 2
+        trans_y = self.canvas_size[0] / 2
+        line_ego = affinity.scale(line_ego, self.scale_x, self.scale_y, origin=(0, 0))
+        line_ego = affinity.affine_transform(line_ego, [1.0, 0.0, 0.0, 1.0, trans_x, trans_y])
+        # print(np.array(list(line_ego.coords), dtype=np.int32).shape)
+        coords = np.array(list(line_ego.coords), dtype=np.int32)[:, :2]
+        coords = coords.reshape((-1, 2))
+        assert len(coords) >= 2
+        cv2.polylines(mask, np.int32([coords]), False, color=color, thickness=thickness)
+
+    @property
+    def fixed_num_sampled_points_condi(self):
+        """
+        return torch.Tensor([N,fixed_num,2]), in xmin, ymin, xmax, ymax form
+            N means the num of instances
+        """
+        assert len(self.instance_list) != 0
+        instance_points_list = []
+        for instance in self.instance_list:
+            if instance.length < 2:
+                continue
+            distances = np.linspace(0, instance.length, self.fixed_num)
+            sampled_points = np.array([list(instance.interpolate(distance).coords) for distance in distances]).reshape(
+                -1, 2)
+            instance_points_list.append(sampled_points)
+        if len(instance_points_list) == 0:
+            for instance in self.instance_list:
+                distances = np.linspace(0, instance.length, self.fixed_num)
+                sampled_points = np.array(
+                    [list(instance.interpolate(distance).coords) for distance in distances]).reshape(
+                    -1, 2)
+                instance_points_list.append(sampled_points)
+
+        instance_points_array = np.array(instance_points_list)
+        instance_points_tensor = to_tensor(instance_points_array)
+        instance_points_tensor = instance_points_tensor.to(
+            dtype=torch.float32)
+        instance_points_tensor[:, :, 0] = torch.clamp(instance_points_tensor[:, :, 0], min=-self.max_x, max=self.max_x)
+        instance_points_tensor[:, :, 1] = torch.clamp(instance_points_tensor[:, :, 1], min=-self.max_y, max=self.max_y)
         return instance_points_tensor
 
     @property
@@ -209,6 +432,175 @@ class LiDARInstanceLines(object):
         instance_points_tensor[:,:,0] = torch.clamp(instance_points_tensor[:,:,0], min=-self.max_x,max=self.max_x)
         instance_points_tensor[:,:,1] = torch.clamp(instance_points_tensor[:,:,1], min=-self.max_y,max=self.max_y)
         return instance_points_tensor
+
+    @property
+    def shift_fixed_dist_sampled_points(self):  # TODO 추가
+
+        assert len(self.instance_list) != 0
+        instances_list = []
+        for idx, instance in enumerate(self.instance_list):
+            # import ipdb;ipdb.set_trace()
+            instance_label = self.instance_labels[idx]
+            # TODO distance 선정 방법 선택
+            # 방법 1: 그냥 fixed distance에 끝점 추가 시작점 0 끝점 10 간격 3이면 0, 3, 6, 9, 10
+            # distances = np.append(np.arange(0, instance.length, self.fixed_dist), instance.length)
+            # 방법 2: fixed distance로 나눈 고른 간격 시작점 0 끝점 10 간격 3이면 0, 3.3333, 6.6666, 10
+            if instance.length > self.fixed_dist:
+                distance = instance.length / (instance.length // self.fixed_dist)
+            else:
+                distance = instance.length
+            distances = np.append(np.arange(0, instance.length, distance), instance.length)
+            poly_pts = np.array(list(instance.coords))
+            start_pts = poly_pts[0]
+            end_pts = poly_pts[-1]
+            is_poly = np.equal(start_pts, end_pts)
+            is_poly = is_poly.all()
+            shift_pts_list = []
+            pts_num, coords_num = poly_pts.shape
+            shift_num = pts_num - 1
+            final_shift_num = self.padding_length - 1
+            if instance_label == 3:  # for centerline
+                # import ipdb;ipdb.set_trace()
+                sampled_points = np.array(
+                    [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                sampled_points_padded = np.pad(sampled_points,
+                                               ((0, self.padding_length - sampled_points.shape[0]), (0, 0)), 'constant',
+                                               constant_values=self.padding_value)
+                shift_pts_list.append(sampled_points_padded)
+            else:
+                if is_poly:
+                    pts_to_shift = poly_pts[:-1, :]
+                    for shift_right_i in range(shift_num):
+                        shift_pts = np.roll(pts_to_shift, shift_right_i, axis=0)
+                        pts_to_concat = shift_pts[0]
+                        pts_to_concat = np.expand_dims(pts_to_concat, axis=0)
+                        shift_pts = np.concatenate((shift_pts, pts_to_concat), axis=0)
+                        shift_instance = LineString(shift_pts)
+                        shift_sampled_points = np.array(
+                            [list(shift_instance.interpolate(distance).coords) for distance in distances]).reshape(-1,
+                                                                                                                   2)
+                        shift_sampled_points_padded = np.pad(shift_sampled_points, (
+                        (0, self.padding_length - shift_sampled_points.shape[0]), (0, 0)), 'constant',
+                                                             constant_values=self.padding_value)
+                        shift_pts_list.append(shift_sampled_points_padded)
+                    # import pdb;pdb.set_trace()
+                else:
+                    sampled_points = np.array(
+                        [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                    sampled_points_padded = np.pad(sampled_points,
+                                                   ((0, self.padding_length - sampled_points.shape[0]), (0, 0)),
+                                                   'constant', constant_values=self.padding_value)
+                    flip_sampled_points = np.flip(sampled_points, axis=0)
+                    flip_sampled_points_padded = np.pad(flip_sampled_points, (
+                    (0, self.padding_length - flip_sampled_points.shape[0]), (0, 0)), 'constant',
+                                                        constant_values=self.padding_value)
+                    shift_pts_list.append(sampled_points_padded)
+                    shift_pts_list.append(flip_sampled_points_padded)
+
+            multi_shifts_pts = np.stack(shift_pts_list, axis=0)
+            shifts_num, _, _ = multi_shifts_pts.shape
+
+            if shifts_num > final_shift_num:
+                index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
+                multi_shifts_pts = multi_shifts_pts[index]
+
+            multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
+            multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(dtype=torch.float32)
+
+            # multi_shifts_pts_tensor[:,:,0] = torch.clamp(multi_shifts_pts_tensor[:,:,0], min=-self.max_x,max=self.max_x)
+            # multi_shifts_pts_tensor[:,:,1] = torch.clamp(multi_shifts_pts_tensor[:,:,1], min=-self.max_y,max=self.max_y)
+            # if not is_poly:
+            if multi_shifts_pts_tensor.shape[0] < final_shift_num:
+                padding = torch.full([final_shift_num - multi_shifts_pts_tensor.shape[0], self.padding_length, 2],
+                                     self.padding_value)
+                multi_shifts_pts_tensor = torch.cat([multi_shifts_pts_tensor, padding], dim=0)
+            instances_list.append(multi_shifts_pts_tensor)
+        instances_tensor = torch.stack(instances_list, dim=0)
+        instances_tensor = instances_tensor.to(dtype=torch.float32)
+        return instances_tensor
+
+    @property
+    def shift_fixed_dist_sampled_points_uni(self):  # TODO 추가
+
+        assert len(self.instance_list) != 0
+        instances_list = []
+        for idx, instance in enumerate(self.instance_list):
+            # import ipdb;ipdb.set_trace()
+            instance_label = self.instance_labels[idx]
+            if instance.length > self.fixed_dist:
+                distances = np.append(np.arange(0, instance.length, self.fixed_dist), instance.length)
+            else:
+                distance = instance.length
+            distances = np.append(np.arange(0, instance.length, distance), instance.length)
+            poly_pts = np.array(list(instance.coords))
+            start_pts = poly_pts[0]
+            end_pts = poly_pts[-1]
+            is_poly = np.equal(start_pts, end_pts)
+            is_poly = is_poly.all()
+            shift_pts_list = []
+            pts_num, coords_num = poly_pts.shape
+            shift_num = pts_num - 1
+            final_shift_num = self.padding_length - 1
+            if instance_label == 3:  # for centerline
+                # import ipdb;ipdb.set_trace()
+                sampled_points = np.array(
+                    [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                sampled_points_padded = np.pad(sampled_points,
+                                               ((0, self.padding_length - sampled_points.shape[0]), (0, 0)), 'constant',
+                                               constant_values=self.padding_value)
+                shift_pts_list.append(sampled_points_padded)
+            else:
+                if is_poly:
+                    pts_to_shift = poly_pts[:-1, :]
+                    for shift_right_i in range(shift_num):
+                        shift_pts = np.roll(pts_to_shift, shift_right_i, axis=0)
+                        pts_to_concat = shift_pts[0]
+                        pts_to_concat = np.expand_dims(pts_to_concat, axis=0)
+                        shift_pts = np.concatenate((shift_pts, pts_to_concat), axis=0)
+                        shift_instance = LineString(shift_pts)
+                        shift_sampled_points = np.array(
+                            [list(shift_instance.interpolate(distance).coords) for distance in distances]).reshape(-1,
+                                                                                                                   2)
+                        shift_sampled_points_padded = np.pad(shift_sampled_points, (
+                            (0, self.padding_length - shift_sampled_points.shape[0]), (0, 0)), 'constant',
+                                                             constant_values=self.padding_value)
+                        shift_pts_list.append(shift_sampled_points_padded)
+                    # import pdb;pdb.set_trace()
+                else:
+                    sampled_points = np.array(
+                        [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                    sampled_points_padded = np.pad(sampled_points,
+                                                   ((0, self.padding_length - sampled_points.shape[0]), (0, 0)),
+                                                   'constant', constant_values=self.padding_value)
+                    flip_sampled_points = np.flip(sampled_points, axis=0)
+                    flip_sampled_points_padded = np.pad(flip_sampled_points, (
+                        (0, self.padding_length - flip_sampled_points.shape[0]), (0, 0)), 'constant',
+                                                        constant_values=self.padding_value)
+                    shift_pts_list.append(sampled_points_padded)
+                    shift_pts_list.append(flip_sampled_points_padded)
+
+            multi_shifts_pts = np.stack(shift_pts_list, axis=0)
+            shifts_num, _, _ = multi_shifts_pts.shape
+
+            if shifts_num > final_shift_num:
+                index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
+                multi_shifts_pts = multi_shifts_pts[index]
+
+            multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
+            multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(dtype=torch.float32)
+
+            # multi_shifts_pts_tensor[:,:,0] = torch.clamp(multi_shifts_pts_tensor[:,:,0], min=-self.max_x,max=self.max_x)
+            # multi_shifts_pts_tensor[:,:,1] = torch.clamp(multi_shifts_pts_tensor[:,:,1], min=-self.max_y,max=self.max_y)
+            # if not is_poly:
+            if multi_shifts_pts_tensor.shape[0] < final_shift_num:
+                padding = torch.full([final_shift_num - multi_shifts_pts_tensor.shape[0], self.padding_length, 2],
+                                     self.padding_value)
+                multi_shifts_pts_tensor = torch.cat([multi_shifts_pts_tensor, padding], dim=0)
+            instances_list.append(multi_shifts_pts_tensor)
+        instances_tensor = torch.stack(instances_list, dim=0)
+        instances_tensor = instances_tensor.to(dtype=torch.float32)
+        return instances_tensor
+
 
     @property
     def shift_fixed_num_sampled_points(self):
@@ -383,6 +775,215 @@ class LiDARInstanceLines(object):
         return instances_tensor
 
     @property
+    def shift_fixed_num_sampled_points_v2_dou(self):
+        """
+        return  [instances_num, num_shifts, fixed_num, 2]
+        """
+        assert len(self.instance_list) != 0
+        instances_list = []
+        for idx, instance in enumerate(self.instance_list):
+            # import ipdb;ipdb.set_trace()
+            instance_label = self.instance_labels[idx]
+            distances = np.linspace(0, instance.length, self.fixed_num*2)
+            poly_pts = np.array(list(instance.coords))
+            start_pts = poly_pts[0]
+            end_pts = poly_pts[-1]
+            is_poly = np.equal(start_pts, end_pts)
+            is_poly = is_poly.all()
+            shift_pts_list = []
+            pts_num, coords_num = poly_pts.shape
+            shift_num = pts_num - 1
+            final_shift_num = self.fixed_num*2 - 1
+            if instance_label == 3:
+                # import ipdb;ipdb.set_trace()
+                sampled_points = np.array(
+                    [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                shift_pts_list.append(sampled_points)
+            else:
+                if is_poly:
+                    pts_to_shift = poly_pts[:-1, :]
+                    for shift_right_i in range(shift_num):
+                        shift_pts = np.roll(pts_to_shift, shift_right_i, axis=0)
+                        pts_to_concat = shift_pts[0]
+                        pts_to_concat = np.expand_dims(pts_to_concat, axis=0)
+                        shift_pts = np.concatenate((shift_pts, pts_to_concat), axis=0)
+                        shift_instance = LineString(shift_pts)
+                        shift_sampled_points = np.array(
+                            [list(shift_instance.interpolate(distance).coords) for distance in distances]).reshape(-1,
+                                                                                                                   2)
+                        shift_pts_list.append(shift_sampled_points)
+                    # import pdb;pdb.set_trace()
+                else:
+                    sampled_points = np.array(
+                        [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                    flip_sampled_points = np.flip(sampled_points, axis=0)
+                    shift_pts_list.append(sampled_points)
+                    shift_pts_list.append(flip_sampled_points)
+
+            multi_shifts_pts = np.stack(shift_pts_list, axis=0)
+            shifts_num, _, _ = multi_shifts_pts.shape
+
+            if shifts_num > final_shift_num:
+                index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
+                multi_shifts_pts = multi_shifts_pts[index]
+
+            multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
+            multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(
+                dtype=torch.float32)
+
+            multi_shifts_pts_tensor[:, :, 0] = torch.clamp(multi_shifts_pts_tensor[:, :, 0], min=-self.max_x,
+                                                           max=self.max_x)
+            multi_shifts_pts_tensor[:, :, 1] = torch.clamp(multi_shifts_pts_tensor[:, :, 1], min=-self.max_y,
+                                                           max=self.max_y)
+            # if not is_poly:
+            if multi_shifts_pts_tensor.shape[0] < final_shift_num:
+                padding = torch.full([final_shift_num - multi_shifts_pts_tensor.shape[0], self.fixed_num*2, 2],
+                                     self.padding_value)
+                multi_shifts_pts_tensor = torch.cat([multi_shifts_pts_tensor, padding], dim=0)
+            instances_list.append(multi_shifts_pts_tensor)
+        instances_tensor = torch.stack(instances_list, dim=0)
+        instances_tensor = instances_tensor.to(
+            dtype=torch.float32)
+        return instances_tensor
+
+    @property
+    def shift_fixed_num_sampled_points_v2_condi(self):
+        """
+        return  [instances_num, num_shifts, fixed_num, 2]
+        """
+        assert len(self.instance_list) != 0
+        instances_list = []
+        for idx, instance in enumerate(self.instance_list):
+            if instance.length < 2:
+                continue
+            # import ipdb;ipdb.set_trace()
+            instance_label = self.instance_labels[idx]
+            distances = np.linspace(0, instance.length, self.fixed_num)
+            poly_pts = np.array(list(instance.coords))
+            start_pts = poly_pts[0]
+            end_pts = poly_pts[-1]
+            is_poly = np.equal(start_pts, end_pts)
+            is_poly = is_poly.all()
+            shift_pts_list = []
+            pts_num, coords_num = poly_pts.shape
+            shift_num = pts_num - 1
+            final_shift_num = self.fixed_num - 1
+            if instance_label == 3:
+                # import ipdb;ipdb.set_trace()
+                sampled_points = np.array(
+                    [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                shift_pts_list.append(sampled_points)
+            else:
+                if is_poly:
+                    pts_to_shift = poly_pts[:-1, :]
+                    for shift_right_i in range(shift_num):
+                        shift_pts = np.roll(pts_to_shift, shift_right_i, axis=0)
+                        pts_to_concat = shift_pts[0]
+                        pts_to_concat = np.expand_dims(pts_to_concat, axis=0)
+                        shift_pts = np.concatenate((shift_pts, pts_to_concat), axis=0)
+                        shift_instance = LineString(shift_pts)
+                        shift_sampled_points = np.array(
+                            [list(shift_instance.interpolate(distance).coords) for distance in distances]).reshape(-1,
+                                                                                                                   2)
+                        shift_pts_list.append(shift_sampled_points)
+                    # import pdb;pdb.set_trace()
+                else:
+                    sampled_points = np.array(
+                        [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                    flip_sampled_points = np.flip(sampled_points, axis=0)
+                    shift_pts_list.append(sampled_points)
+                    shift_pts_list.append(flip_sampled_points)
+
+            multi_shifts_pts = np.stack(shift_pts_list, axis=0)
+            shifts_num, _, _ = multi_shifts_pts.shape
+
+            if shifts_num > final_shift_num:
+                index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
+                multi_shifts_pts = multi_shifts_pts[index]
+
+            multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
+            multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(
+                dtype=torch.float32)
+
+            multi_shifts_pts_tensor[:, :, 0] = torch.clamp(multi_shifts_pts_tensor[:, :, 0], min=-self.max_x,
+                                                           max=self.max_x)
+            multi_shifts_pts_tensor[:, :, 1] = torch.clamp(multi_shifts_pts_tensor[:, :, 1], min=-self.max_y,
+                                                           max=self.max_y)
+            # if not is_poly:
+            if multi_shifts_pts_tensor.shape[0] < final_shift_num:
+                padding = torch.full([final_shift_num - multi_shifts_pts_tensor.shape[0], self.fixed_num, 2],
+                                     self.padding_value)
+                multi_shifts_pts_tensor = torch.cat([multi_shifts_pts_tensor, padding], dim=0)
+            instances_list.append(multi_shifts_pts_tensor)
+
+        if len(instances_list) == 0:
+            for idx, instance in enumerate(self.instance_list):
+                # import ipdb;ipdb.set_trace()
+                instance_label = self.instance_labels[idx]
+                distances = np.linspace(0, instance.length, self.fixed_num)
+                poly_pts = np.array(list(instance.coords))
+                start_pts = poly_pts[0]
+                end_pts = poly_pts[-1]
+                is_poly = np.equal(start_pts, end_pts)
+                is_poly = is_poly.all()
+                shift_pts_list = []
+                pts_num, coords_num = poly_pts.shape
+                shift_num = pts_num - 1
+                final_shift_num = self.fixed_num - 1
+                if instance_label == 3:
+                    # import ipdb;ipdb.set_trace()
+                    sampled_points = np.array(
+                        [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                    shift_pts_list.append(sampled_points)
+                else:
+                    if is_poly:
+                        pts_to_shift = poly_pts[:-1, :]
+                        for shift_right_i in range(shift_num):
+                            shift_pts = np.roll(pts_to_shift, shift_right_i, axis=0)
+                            pts_to_concat = shift_pts[0]
+                            pts_to_concat = np.expand_dims(pts_to_concat, axis=0)
+                            shift_pts = np.concatenate((shift_pts, pts_to_concat), axis=0)
+                            shift_instance = LineString(shift_pts)
+                            shift_sampled_points = np.array(
+                                [list(shift_instance.interpolate(distance).coords) for distance in distances]).reshape(
+                                -1,
+                                2)
+                            shift_pts_list.append(shift_sampled_points)
+                        # import pdb;pdb.set_trace()
+                    else:
+                        sampled_points = np.array(
+                            [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                        flip_sampled_points = np.flip(sampled_points, axis=0)
+                        shift_pts_list.append(sampled_points)
+                        shift_pts_list.append(flip_sampled_points)
+
+                multi_shifts_pts = np.stack(shift_pts_list, axis=0)
+                shifts_num, _, _ = multi_shifts_pts.shape
+
+                if shifts_num > final_shift_num:
+                    index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
+                    multi_shifts_pts = multi_shifts_pts[index]
+
+                multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
+                multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(
+                    dtype=torch.float32)
+
+                multi_shifts_pts_tensor[:, :, 0] = torch.clamp(multi_shifts_pts_tensor[:, :, 0], min=-self.max_x,
+                                                               max=self.max_x)
+                multi_shifts_pts_tensor[:, :, 1] = torch.clamp(multi_shifts_pts_tensor[:, :, 1], min=-self.max_y,
+                                                               max=self.max_y)
+                # if not is_poly:
+                if multi_shifts_pts_tensor.shape[0] < final_shift_num:
+                    padding = torch.full([final_shift_num - multi_shifts_pts_tensor.shape[0], self.fixed_num, 2],
+                                         self.padding_value)
+                    multi_shifts_pts_tensor = torch.cat([multi_shifts_pts_tensor, padding], dim=0)
+                instances_list.append(multi_shifts_pts_tensor)
+        instances_tensor = torch.stack(instances_list, dim=0)
+        instances_tensor = instances_tensor.to(
+            dtype=torch.float32)
+        return instances_tensor
+
+    @property
     def shift_fixed_num_sampled_points_v3(self):
         """
         return  [instances_num, num_shifts, fixed_num, 2]
@@ -525,6 +1126,116 @@ class LiDARInstanceLines(object):
                             dtype=torch.float32)
         return instances_tensor
 
+    # TODO mask #
+    @property
+    def instance_segments(self):
+
+        assert len(self.instance_list) != 0
+        instance_points_list = []
+        self.mask_size = [200, 100]  # TODO simple bev
+        self.scale_y = self.mask_size[0] / self.patch_size[0]
+        self.scale_x = self.mask_size[1] / self.patch_size[1]
+        instance_segm_list = []
+        for instance in self.instance_list:
+            distances = np.arange(0, instance.length, self.sample_dist)
+            # HD map gt가 fixed로 선언되어 있어 fixed로 하려다가 1 phase에서는 segmentation만 진행하니까 왜곡이 적은게 낫지 않을까 하여 dist로 했습니다
+            poly_pts = np.array(list(instance.coords))
+            start_pts = poly_pts[0]
+            end_pts = poly_pts[-1]
+            is_poly = np.equal(start_pts, end_pts)
+            is_poly = is_poly.all()
+            sampled_points = np.array(
+                [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+            instance_points_list.append(sampled_points)
+        for instance in instance_points_list:
+            instance_segm = np.zeros((self.mask_size[0], self.mask_size[1]), dtype=np.uint8)
+            try:
+                self.line_ego_to_mask(LineString(instance), instance_segm, color=1, thickness=3)
+            except:
+                pass
+            instance_segm_list.append(instance_segm)
+
+        instance_segm_tensor = to_tensor(instance_segm_list)
+        return instance_segm_tensor
+
+    @property
+    def instance_segments_condi(self):
+
+        assert len(self.instance_list) != 0
+        instance_points_list = []
+        self.mask_size = [200, 100]  # TODO simple bev
+        self.scale_y = self.mask_size[0] / self.patch_size[0]
+        self.scale_x = self.mask_size[1] / self.patch_size[1]
+        instance_segm_list = []
+        for instance in self.instance_list:
+            if instance.length < 2:
+                continue
+            distances = np.arange(0, instance.length, self.sample_dist)
+            # HD map gt가 fixed로 선언되어 있어 fixed로 하려다가 1 phase에서는 segmentation만 진행하니까 왜곡이 적은게 낫지 않을까 하여 dist로 했습니다
+            poly_pts = np.array(list(instance.coords))
+            start_pts = poly_pts[0]
+            end_pts = poly_pts[-1]
+            is_poly = np.equal(start_pts, end_pts)
+            is_poly = is_poly.all()
+            sampled_points = np.array(
+                [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+            instance_points_list.append(sampled_points)
+
+        if len(instance_points_list) == 0:
+            for instance in self.instance_list:
+                distances = np.arange(0, instance.length, self.sample_dist)
+                # HD map gt가 fixed로 선언되어 있어 fixed로 하려다가 1 phase에서는 segmentation만 진행하니까 왜곡이 적은게 낫지 않을까 하여 dist로 했습니다
+                poly_pts = np.array(list(instance.coords))
+                start_pts = poly_pts[0]
+                end_pts = poly_pts[-1]
+                is_poly = np.equal(start_pts, end_pts)
+                is_poly = is_poly.all()
+                sampled_points = np.array(
+                    [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                instance_points_list.append(sampled_points)
+
+        for instance in instance_points_list:
+            instance_segm = np.zeros((self.mask_size[0], self.mask_size[1]), dtype=np.uint8)
+            try:
+                self.line_ego_to_mask(LineString(instance), instance_segm, color=1, thickness=3)
+            except:
+                pass
+            instance_segm_list.append(instance_segm)
+
+        instance_segm_tensor = to_tensor(instance_segm_list)
+        return instance_segm_tensor
+
+    @property
+    def instance_segments_v2(self):
+
+        assert len(self.instance_list) != 0
+        instance_points_list = []
+        self.mask_size = [200, 100]  # TODO simple bev
+        self.scale_y = self.mask_size[0] / self.patch_size[0]
+        self.scale_x = self.mask_size[1] / self.patch_size[1]
+        instance_segm_list = []
+        for instance in self.instance_list:
+            distances = np.arange(0, instance.length, self.sample_dist)
+            # HD map gt가 fixed로 선언되어 있어 fixed로 하려다가 1 phase에서는 segmentation만 진행하니까 왜곡이 적은게 낫지 않을까 하여 dist로 했습니다
+            poly_pts = np.array(list(instance.coords))
+            start_pts = poly_pts[0]
+            end_pts = poly_pts[-1]
+            is_poly = np.equal(start_pts, end_pts)
+            is_poly = is_poly.all()
+            sampled_points = np.array(
+                [list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+            instance_points_list.append(sampled_points)
+        for instance in instance_points_list:
+            instance_segm = np.zeros((self.mask_size[0], self.mask_size[1]), dtype=np.uint8)
+            try:
+                self.line_ego_to_mask(LineString(instance), instance_segm, color=1, thickness=1)
+            except:
+                pass
+            instance_segm_list.append(instance_segm)
+
+        instance_segm_tensor = to_tensor(instance_segm_list)
+        return instance_segm_tensor
+# TODO mask ##
 
 
 class VectorizedLocalMap(object):
@@ -543,6 +1254,7 @@ class VectorizedLocalMap(object):
                  num_samples=250,
                  padding=False,
                  fixed_ptsnum_per_line=-1,
+                 Ext_fixed_ptsnum_per_line=-1,
                  padding_value=-10000,
                  thickness=3,
                  aux_seg = dict(
@@ -564,6 +1276,7 @@ class VectorizedLocalMap(object):
         self.num_samples = num_samples
         self.padding = padding
         self.fixed_num = fixed_ptsnum_per_line
+        self.Ext_fixed_num = Ext_fixed_ptsnum_per_line
         self.padding_value = padding_value
 
         # for semantic mask
@@ -592,10 +1305,8 @@ class VectorizedLocalMap(object):
         gt_instance = []
         if self.aux_seg['use_aux_seg']:
             if self.aux_seg['seg_classes'] == 1:
-                if self.aux_seg['bev_seg']:
-                    gt_semantic_mask = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
-                else:
-                    gt_semantic_mask = None
+                gt_semantic_mask = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+
                 # import ipdb;ipdb.set_trace()
                 if self.aux_seg['pv_seg']:
                     num_cam  = len(example['img_metas'].data['pad_shape'])
@@ -614,18 +1325,15 @@ class VectorizedLocalMap(object):
                         gt_instance.append(instance)
                         gt_labels.append(instance_type)
                         if instance.geom_type == 'LineString':
-                            if self.aux_seg['bev_seg']:
-                                self.line_ego_to_mask(instance, gt_semantic_mask[0], color=1, thickness=self.thickness)
+                            self.line_ego_to_mask(instance, gt_semantic_mask[0], color=1, thickness=self.thickness)
                             if self.aux_seg['pv_seg']:
                                 for cam_index in range(num_cam):
                                     self.line_ego_to_pvmask(instance, gt_pv_semantic_mask[cam_index][0], lidar2feat[cam_index],color=1, thickness=self.aux_seg['pv_thickness'])
                         else:
                             print(instance.geom_type)
             else:
-                if self.aux_seg['bev_seg']:
-                    gt_semantic_mask = np.zeros((len(self.vec_classes), self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
-                else:
-                    gt_semantic_mask = None
+                gt_semantic_mask = np.zeros((len(self.vec_classes), self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+
                 if self.aux_seg['pv_seg']:
                     num_cam  = len(example['img_metas'].data['pad_shape'])
                     gt_pv_semantic_mask = np.zeros((num_cam, len(self.vec_classes), img_shape[0] // feat_down_sample, img_shape[1] // feat_down_sample), dtype=np.uint8)
@@ -641,8 +1349,7 @@ class VectorizedLocalMap(object):
                         gt_instance.append(instance)
                         gt_labels.append(instance_type)
                         if instance.geom_type == 'LineString':
-                            if self.aux_seg['bev_seg']:
-                                self.line_ego_to_mask(instance, gt_semantic_mask[instance_type], color=1, thickness=self.thickness)
+                            self.line_ego_to_mask(instance, gt_semantic_mask[instance_type], color=1, thickness=self.thickness)
                             if self.aux_seg['pv_seg']:
                                 for cam_index in range(num_cam):
                                     self.line_ego_to_pvmask(instance, gt_pv_semantic_mask[cam_index][instance_type], lidar2feat[cam_index],color=1, thickness=self.aux_seg['pv_thickness'])
@@ -656,7 +1363,7 @@ class VectorizedLocalMap(object):
             gt_semantic_mask=None
             gt_pv_semantic_mask=None
         gt_instance = LiDARInstanceLines(gt_instance,gt_labels, self.sample_dist,
-                        self.num_samples, self.padding, self.fixed_num,self.padding_value, patch_size=self.patch_size)
+                        self.num_samples, self.padding, self.fixed_num, self.Ext_fixed_num,self.padding_value, patch_size=self.patch_size)
 
 
         anns_results = dict(
@@ -1033,11 +1740,13 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
                  pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
                  overlap_test=False, 
                  fixed_ptsnum_per_line=-1,
+                 Ext_fixed_ptsnum_per_line=-1,
                  eval_use_same_gt_sample_num_flag=False,
                  padding_value=-10000,
                  map_classes=None,
                  noise='None',
                  noise_std=0,
+                 pts_thr=0.8,
                  aux_seg = dict(
                     use_aux_seg=False,
                     bev_seg=False,
@@ -1045,15 +1754,22 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
                     seg_classes=1,
                     feat_down_sample=32,
                  ),
+                 mini_train = False,
+                 sort_by_scene=False,
+                 use_sequence_group_flag=False,  # TODO multi gpu
+                 sequences_split_num=1,  # TODO multi gpu
+                 dn_enabled=False,  # TODO dn
                  *args, 
                  **kwargs):
+        self.mini_train = mini_train
+        self.sort_by_scene = sort_by_scene
         super().__init__(*args, **kwargs)
         self.map_ann_file = map_ann_file
 
         self.queue_length = queue_length
         self.overlap_test = overlap_test
-        self.bev_size = bev_size
 
+        self.bev_size = bev_size
         self.MAPCLASSES = self.get_map_classes(map_classes)
         self.NUM_MAPCLASSES = len(self.MAPCLASSES)
         self.pc_range = pc_range
@@ -1064,15 +1780,29 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
         self.fixed_num = fixed_ptsnum_per_line
         self.eval_use_same_gt_sample_num_flag = eval_use_same_gt_sample_num_flag
         self.aux_seg = aux_seg
+        self.pts_thr = pts_thr
         self.vector_map = VectorizedLocalMap(canvas_size=bev_size,
                                              patch_size=self.patch_size, 
                                              map_classes=self.MAPCLASSES, 
                                              fixed_ptsnum_per_line=fixed_ptsnum_per_line,
+                                             Ext_fixed_ptsnum_per_line=Ext_fixed_ptsnum_per_line,
                                              padding_value=self.padding_value,
                                              aux_seg=aux_seg)
         self.is_vis_on_test = False
         self.noise = noise
         self.noise_std = noise_std
+        # TODO multi gpu
+        self.use_sequence_group_flag = use_sequence_group_flag
+        self.sequences_split_num = sequences_split_num
+        # TODO sort_by_scene #
+        if self.sort_by_scene:
+            # sequences_split_num splits each sequence into sequences_split_num parts.
+            if self.test_mode:
+                assert self.sequences_split_num == 1
+            if self.use_sequence_group_flag:
+                self._set_sequence_group_flag()
+        self.dn_enabled = dn_enabled  # TODO dn
+
     @classmethod
     def get_map_classes(cls, map_classes=None):
         """Get class names of current dataset.
@@ -1099,6 +1829,74 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
             raise ValueError(f'Unsupported type {type(map_classes)} of map classes.')
 
         return class_names
+
+    def _set_sequence_group_flag(self):  # TODO multi gpu
+        """
+        Set each sequence to be a different group
+        """
+        res = []
+
+        curr_sequence = 0
+        for idx in range(len(self.data_infos)):
+            if idx != 0 and len(self.data_infos[idx]['sweeps']) == 0:
+                # Not first frame and # of sweeps is 0 -> new sequence
+                curr_sequence += 1
+            res.append(curr_sequence)
+        self.flag = np.array(res, dtype=np.int64)
+        if self.sequences_split_num != 1:
+            if self.sequences_split_num == 'all':
+                self.flag = np.array(range(len(self.data_infos)), dtype=np.int64)
+            else:
+                bin_counts = np.bincount(self.flag)
+                new_flags = []
+                curr_new_flag = 0
+                for curr_flag in range(len(bin_counts)):
+                    curr_sequence_length = np.array(
+                        list(range(0,
+                                   bin_counts[curr_flag],
+                                   math.ceil(bin_counts[curr_flag] / self.sequences_split_num)))
+                        + [bin_counts[curr_flag]])
+
+                    for sub_seq_idx in (curr_sequence_length[1:] - curr_sequence_length[:-1]):
+                        for _ in range(sub_seq_idx):
+                            new_flags.append(curr_new_flag)
+                        curr_new_flag += 1
+
+                assert len(new_flags) == len(self.flag)
+                assert len(np.bincount(new_flags)) == len(np.bincount(self.flag)) * self.sequences_split_num
+                self.flag = np.array(new_flags, dtype=np.int64)
+
+    def load_annotations(self, ann_file):
+        """Load annotations from ann_file.
+
+        Args:
+            ann_file (str): Path of the annotation file.
+
+        Returns:
+            list[dict]: List of annotations sorted by timestamps.
+        """
+        data = mmcv.load(ann_file, file_format='pkl')
+        # TODO sort_by_scene #
+        if self.sort_by_scene:
+            data_infos = list(sorted(data['infos'], key=lambda e: e['timestamp']))
+        else:
+            data_infos = data['infos']
+
+        if self.mini_train == 'split':
+            data_infos = data_infos[:len(data_infos)//4]
+        elif self.mini_train:
+            data_infos = data_infos[::self.mini_train]
+        else:
+            pass
+
+        print(len(data_infos))
+        # data_infos = data_infos[4000*4:]
+
+    
+        self.metadata = data['metadata']
+        self.version = self.metadata['version']
+        return data_infos
+    
     def vectormap_pipeline(self, example, input_dict):
         '''
         `example` type: <class 'dict'>
@@ -1167,6 +1965,11 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
         # import pdb;pdb.set_trace()
         example = self.pipeline(input_dict)
         example = self.vectormap_pipeline(example,input_dict)
+
+        if self.dn_enabled:
+            example["img_metas"].data.update(
+                {"gt_bboxes_3d": example["gt_bboxes_3d"], "gt_labels_3d": example["gt_labels_3d"]})  # TODO dn
+
         if self.filter_empty_gt and \
                 (example is None or ~(example['gt_labels_3d']._data != -1).any()):
             return None
@@ -1236,6 +2039,122 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
         queue = queue[-1]
         return queue
 
+    def get_prev_infos(self, index):  # TODO 추가
+
+        curr_info = self.data_infos[index]
+        lidar2ego = np.eye(4)
+        lidar2ego[:3, :3] = Quaternion(curr_info['lidar2ego_rotation']).rotation_matrix
+        lidar2ego[:3, 3] = curr_info['lidar2ego_translation']
+        ego2global = np.eye(4)
+        ego2global[:3, :3] = Quaternion(curr_info['ego2global_rotation']).rotation_matrix
+        ego2global[:3, 3] = curr_info['ego2global_translation']
+        lidar2global_curr = ego2global @ lidar2ego
+
+        prev_infos = []
+        prev_token = self.data_infos[index]['prev']
+        while len(prev_infos) < 4:
+            if prev_token == '':
+                return prev_infos
+            tmp = dict()
+            for info in self.data_infos:
+                if info['token'] == prev_token:
+                    break
+            tmp['token'] = prev_token
+            lidar2ego = np.eye(4)
+            lidar2ego[:3, :3] = Quaternion(info['lidar2ego_rotation']).rotation_matrix
+            lidar2ego[:3, 3] = info['lidar2ego_translation']
+            ego2global = np.eye(4)
+            ego2global[:3, :3] = Quaternion(info['ego2global_rotation']).rotation_matrix
+            ego2global[:3, 3] = info['ego2global_translation']
+
+            lidar2global_prev = ego2global @ lidar2ego
+
+            prev2curr = np.linalg.inv(lidar2global_curr) @ lidar2global_prev
+            
+            tmp['prev2curr'] = prev2curr
+            gt_pts_list = []
+            gt_label_list = []
+            for k, v in info['annotation'].items():
+                if k == 'centerline':
+                    continue
+                for instance in v:
+                    line = LineString(instance)
+                    distances = np.linspace(0, line.length, self.fixed_num)
+                    sampled_points = np.array(
+                        [list(line.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
+                    gt_pts_list.append(sampled_points)
+                    gt_label_list.append(self.MAPCLASSES.index(k))
+                gt_pts_array = np.array(gt_pts_list)
+                gt_pts_tensor = to_tensor(gt_pts_array)
+                gt_pts_tensor = gt_pts_tensor.to(dtype=torch.float32)
+                if len(gt_pts_tensor.shape) == 3:
+                    gt_pts_tensor[:, :, 0] = torch.clamp(gt_pts_tensor[:, :, 0], min=-self.patch_size[1] / 2,
+                                                         max=self.patch_size[1] / 2)
+                    gt_pts_tensor[:, :, 1] = torch.clamp(gt_pts_tensor[:, :, 1], min=-self.patch_size[0] / 2,
+                                                         max=self.patch_size[0] / 2)
+                    gt_label_array = np.array(gt_label_list)
+                    gt_label_tensor = to_tensor(gt_label_array)
+                else:
+                    gt_pts_tensor = torch.zeros([0, 20, 2])
+                    gt_label_tensor = torch.zeros([0])
+            tmp['gt_pts'] = gt_pts_tensor
+            tmp['gt_label'] = gt_label_tensor
+
+            self.canvas_size = [200, 100]
+            self.scale_x = self.canvas_size[1] / self.patch_size[1]
+            self.scale_y = self.canvas_size[0] / self.patch_size[0]
+
+            gt_semantic_mask_0 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+            gt_semantic_mask_1 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+            gt_semantic_mask_2 = np.zeros((1, self.canvas_size[0], self.canvas_size[1]), dtype=np.uint8)
+            
+            for k, v in info['annotation'].items():
+                if k == 'centerline':
+                    continue
+                for instance in v:
+                    line = LineString(instance)
+                    if self.MAPCLASSES.index(k) == 0:
+                        self.line_ego_to_mask(line, gt_semantic_mask_0[0], color=1, thickness=3)
+                    elif self.MAPCLASSES.index(k) == 1:
+                        self.line_ego_to_mask(line, gt_semantic_mask_1[0], color=1, thickness=3)
+                    elif self.MAPCLASSES.index(k) == 2:
+                        self.line_ego_to_mask(line, gt_semantic_mask_2[0], color=1, thickness=3)
+            
+            gt_semantic_mask = np.concatenate(
+                [gt_semantic_mask_0.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])
+                    , gt_semantic_mask_1.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])
+                    , gt_semantic_mask_2.reshape(1, 1, self.canvas_size[0], self.canvas_size[1])], 1)
+            
+            tmp['gt_seg'] = to_tensor(gt_semantic_mask)
+            prev_infos.append(tmp)
+            prev_token = info['prev']
+        return prev_infos
+    
+    def line_ego_to_mask(self,
+                         line_ego,
+                         mask,
+                         color=1,
+                         thickness=3):
+        ''' Rasterize a single line to mask.
+
+        Args:
+            line_ego (LineString): line
+            mask (array): semantic mask to paint on
+            color (int): positive label, default: 1
+            thickness (int): thickness of rasterized lines, default: 3
+        '''
+
+        trans_x = self.canvas_size[1] / 2
+        trans_y = self.canvas_size[0] / 2
+        line_ego = affinity.scale(line_ego, self.scale_x, self.scale_y, origin=(0, 0))
+        line_ego = affinity.affine_transform(line_ego, [1.0, 0.0, 0.0, 1.0, trans_x, trans_y])
+        # print(np.array(list(line_ego.coords), dtype=np.int32).shape)
+        coords = np.array(list(line_ego.coords), dtype=np.int32)[:, :2]
+        coords = coords.reshape((-1, 2))
+        assert len(coords) >= 2
+
+        cv2.polylines(mask, np.int32([coords]), False, color=color, thickness=thickness)
+
     def get_data_info(self, index):
         """Get data info according to the given index.
 
@@ -1256,6 +2175,7 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
                 - ann_info (dict): Annotation info.
         """
         info = self.data_infos[index]
+        # prev_infos = self.get_prev_infos(index)
         # standard protocal modified from SECOND.Pytorch
         input_dict = dict(
             sample_idx=info['token'],
@@ -1273,6 +2193,7 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
             frame_idx=info['frame_idx'],
             timestamp=info['timestamp'],
             map_location = info['map_location'],
+            # prev_infos=prev_infos     # TODO dn
         )
         # lidar to ego transform
         lidar2ego = np.eye(4).astype(np.float32)
@@ -1456,7 +2377,12 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
         print('Start to convert map detection format...')
         for sample_id, det in enumerate(mmcv.track_iter_progress(results)):
             pred_anno = {}
-            vecs = output_to_vecs(det)
+            vecs = output_to_vecs(det, self.pts_thr)
+            try:
+                ref_logits = det['ref_logits'].detach().cpu().numpy()  # TODO 변경
+                pred_anno['ref_logits'] = ref_logits  # TODO 변경
+            except:
+                pass
             sample_token = self.data_infos[sample_id]['token']
             pred_anno['sample_token'] = sample_token
             pred_vec_list=[]
@@ -1628,8 +2554,9 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
         Returns:
             dict[str, float]: Results of each evaluation metric.
         """
+        # jsonfile_prefix =jsonfile_prefix.split('/')[:2]
+        # path = jsonfile_prefix[0] + '/' + jsonfile_prefix[1]
         result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
-
         if isinstance(result_files, dict):
             results_dict = dict()
             for name in result_names:
@@ -1646,23 +2573,291 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
             self.show(results, out_dir, pipeline=pipeline)
         return results_dict
 
+    def Vector_evaluate(self,
+                        pred_vectors,
+                        scores,
+                        groundtruth,
+                        thresholds,
+                        metric):
+        from projects.mmdet3d_plugin.datasets.map_utils.AP import instance_match
+        ''' Do single-frame matching for one class.
 
-def output_to_vecs(detection):
+        Args:
+            pred_vectors (List): List[vector(ndarray) (different length)],
+            scores (List): List[score(float)]
+            groundtruth (List): List of vectors
+            thresholds (List): List of thresholds
+
+        Returns:
+            tp_fp_score_by_thr (Dict): matching results at different thresholds
+                e.g. {0.5: (M, 2), 1.0: (M, 2), 1.5: (M, 2)}
+        '''
+        SAMPLE_DIST = 0.3
+        pred_lines = []
+
+        # interpolate predictions
+        for vector in pred_vectors:
+            vector = np.array(vector)
+            # vector_interp = self.interp_fixed_num(vector, INTERP_NUM)
+            vector_interp = self.interp_fixed_dist(vector, SAMPLE_DIST)
+            pred_lines.append(vector_interp)
+
+        # interpolate groundtruth
+        gt_lines = []
+        for vector in groundtruth:
+            # vector_interp = self.interp_fixed_num(vector, INTERP_NUM)
+            vector_interp = self.interp_fixed_dist(vector, SAMPLE_DIST)
+            gt_lines.append(vector_interp)
+
+        scores = np.array(scores)
+        tp_fp_list = instance_match(pred_lines, scores, gt_lines, thresholds, metric[0])  # (M, 2)
+        tp_fp_score_by_thr = {}
+        for i, thr in enumerate(thresholds):
+            tp, fp = tp_fp_list[i]
+            tp_fp_score = np.hstack([tp[:, None], fp[:, None], scores[:, None]])
+            tp_fp_score_by_thr[thr] = tp_fp_score
+
+        return tp_fp_score_by_thr  # {0.5: (M, 2), 1.0: (M, 2), 1.5: (M, 2)}
+
+    def interp_fixed_dist(self,
+                          vector,
+                          sample_dist):
+        ''' Interpolate a line at fixed interval.
+
+        Args:
+            vector (LineString): vector
+            sample_dist (float): sample interval
+
+        Returns:
+            points (array): interpolated points, shape (N, 2)
+        '''
+
+        line = LineString(vector)
+        distances = list(np.arange(sample_dist, line.length, sample_dist))
+        # make sure to sample at least two points when sample_dist > line.length
+        distances = [0, ] + distances + [line.length, ]
+
+        sampled_points = np.array([list(line.interpolate(distance).coords)
+                                   for distance in distances]).squeeze()
+
+        return sampled_points
+
+    def _evaluate_single_dist(self,
+                         result_path,
+                         logger=None,
+                         metric='chamfer',
+                         result_name='pts_bbox'):
+
+        from projects.mmdet3d_plugin.datasets.map_utils.AP import average_precision
+        result_path = osp.abspath(result_path)
+        detail = dict()
+
+        print('Formating results & gts by classes')
+        with open(result_path, 'r') as f:
+            pred_results = json.load(f)
+        gen_results = pred_results['results']
+        with open(self.map_ann_file, 'r') as ann_f:
+            gt_anns = json.load(ann_f)
+        annotations = gt_anns['GTs']
+        
+        results_tokes = [gen_resu['sample_token']  for gen_resu in gen_results]
+        
+        CAT2ID = {'ped_crossing': 0, 'divider': 1, 'boundary': 2}
+        id2cat = {v: k for k, v in CAT2ID.items()}
+        samples_by_cls = {label: [] for label in id2cat.keys()}
+        num_gts = {label: 0 for label in id2cat.keys()}
+        num_preds = {label: 0 for label in id2cat.keys()}
+        
+        # align by token
+        for ge_idx in range(len(annotations)):
+            if annotations[ge_idx]['sample_token'] in results_tokes:
+                if annotations[ge_idx]['sample_token'] == gen_results[ge_idx]['sample_token']:
+                    pred = gen_results[ge_idx]['vectors']
+                else:
+                    for temp_idx in range(len(gen_results)):
+                        if annotations[ge_idx]['sample_token'] == gen_results[temp_idx]['sample_token']:
+                            pred = gen_results[temp_idx]['vectors']
+
+            # for every sample
+            vectors_by_cls = {label: [] for label in id2cat.keys()}
+            scores_by_cls = {label: [] for label in id2cat.keys()}
+
+            gt = annotations[ge_idx]['vectors']
+            # for every sample
+            GT_vectors_by_cls = {label: [] for label in id2cat.keys()}
+            
+            for i in range(len(gt)):
+                # i-th pred line in sample
+                label = gt[i]['type']
+                vector = gt[i]['pts']
+
+                GT_vectors_by_cls[label].append(vector)
+            c = 0
+            for i in range(len(pred)):
+                # i-th pred line in sample
+                label = pred[i]['type']
+                vector = pred[i]['pts']
+                score = pred[i]['confidence_level']
+                
+                if len(vector) < 2:
+                    c+=1
+                    continue
+
+                vectors_by_cls[label].append(vector)
+                scores_by_cls[label].append(score)
+
+            for label, cat in id2cat.items():
+                new_sample = (vectors_by_cls[label], scores_by_cls[label], GT_vectors_by_cls[label])
+                num_gts[label] += len(GT_vectors_by_cls[label])
+                num_preds[label] += len(scores_by_cls[label])
+                samples_by_cls[label].append(new_sample)
+
+        result_dict = {}
+
+        print(f'\nevaluating {len(id2cat)} categories...')
+        THRESHOLDS = [0.5, 1.0, 1.5]
+        sum_mAP = 0
+        pbar = mmcv.ProgressBar(len(id2cat))
+        for label in id2cat.keys():
+            samples = samples_by_cls[label]  # List[(pred_lines, scores, gts)]
+            result_dict[id2cat[label]] = {
+                'num_gts': num_gts[label],
+                'num_preds': num_preds[label]
+            }
+            sum_AP = 0
+
+            fn = partial(self.Vector_evaluate, thresholds=THRESHOLDS, metric=metric)
+            # if self.n_workers > 0:
+            #     tpfp_score_list = pool.starmap(fn, samples)
+            # else:
+            tpfp_score_list = []
+
+            for sample in samples:
+                tpfp_score_list.append(fn(*sample))
+
+            for thr in THRESHOLDS:
+                tp_fp_score = [i[thr] for i in tpfp_score_list]
+                tp_fp_score = np.vstack(tp_fp_score)  # (num_dets, 3)
+                sort_inds = np.argsort(-tp_fp_score[:, -1])
+
+                tp = tp_fp_score[sort_inds, 0]  # (num_dets,)
+                fp = tp_fp_score[sort_inds, 1]  # (num_dets,)
+                tp = np.cumsum(tp, axis=0)
+                fp = np.cumsum(fp, axis=0)
+                eps = np.finfo(np.float32).eps
+                recalls = tp / np.maximum(num_gts[label], eps)
+                precisions = tp / np.maximum((tp + fp), eps)
+
+                AP = average_precision(recalls, precisions, 'area')
+                sum_AP += AP
+                result_dict[id2cat[label]].update({f'AP@{thr}': AP})
+
+            pbar.update()
+
+            AP = sum_AP / len(THRESHOLDS)
+            sum_mAP += AP
+
+            result_dict[id2cat[label]].update({f'AP': AP})
+
+        mAP = sum_mAP / len(id2cat.keys())
+        result_dict.update({'mAP': mAP})
+
+        # print results
+        table = prettytable.PrettyTable(['category', 'num_preds', 'num_gts'] +
+                                        [f'AP@{thr}' for thr in THRESHOLDS] + ['AP'])
+        for label in id2cat.keys():
+            table.add_row([
+                id2cat[label],
+                result_dict[id2cat[label]]['num_preds'],
+                result_dict[id2cat[label]]['num_gts'],
+                *[round(result_dict[id2cat[label]][f'AP@{thr}'], 4) for thr in THRESHOLDS],
+                round(result_dict[id2cat[label]]['AP'], 4),
+            ])
+
+        from mmcv.utils import print_log
+        print_log('\n' + str(table), logger=logger)
+        print_log(f'mAP = {mAP:.4f}\n', logger=logger)
+
+        new_result_dict = {}
+        for name in CAT2ID:
+            new_result_dict[name] = result_dict[name]['AP']
+
+        return annotations
+
+    def evaluate_dist(self,
+                      results,
+                      metric='bbox',
+                      logger=None,
+                      jsonfile_prefix=None,
+                      result_names=['pts_bbox'],
+                      show=False,
+                      out_dir=None,
+                      pipeline=None):
+        result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
+        
+        if isinstance(result_files, dict):
+            results_dict = dict()
+            for name in result_names:
+                print('Evaluating bboxes of {}'.format(name))
+                ret_dict = self._evaluate_single_dist(result_files[name], metric=metric)
+            results_dict.update(ret_dict)
+        elif isinstance(result_files, str):
+            results_dict = self._evaluate_single_dist(result_files, metric=metric)
+
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+
+        if show:
+            self.show(results, out_dir, pipeline=pipeline)
+        return results_dict
+
+def output_to_vecs(detection, pts_thr ):
     box3d = detection['boxes_3d'].numpy()
     scores = detection['scores_3d'].numpy()
     labels = detection['labels_3d'].numpy()
     pts = detection['pts_3d'].numpy()
 
+    # else:
     vec_list = []
     for i in range(box3d.shape[0]):
+        # if pts.shape[1] > 41:
+        #     if calculate_polyline_length(pts[i]) < 40:
+        #         pts_sam = pts[i][::(pts[i].shape[0]//20)]
+        #     elif calculate_polyline_length(pts[i]) < 100:
+        #         pts_sam = pts[i][::(pts[i].shape[0] // 40)]
+        #     else:
+        #         pts_sam = pts[i]
+        #     vec = dict(
+        #         bbox=box3d[i],  # xyxy
+        #         label=labels[i],
+        #         score=scores[i],
+        #         pts=pts_sam,
+        #     )
+        #     vec_list.append(vec)
+        # else:
+        #     vec = dict(
+        #         bbox = box3d[i], # xyxy
+        #         label=labels[i],
+        #         score=scores[i],
+        #         pts=pts[i],
+        #     )
+        #     vec_list.append(vec)
+
         vec = dict(
-            bbox = box3d[i], # xyxy
+            bbox=box3d[i],  # xyxy
             label=labels[i],
             score=scores[i],
             pts=pts[i],
         )
         vec_list.append(vec)
     return vec_list
+
+def calculate_polyline_length(points):
+    length = 0
+    for i in range(len(points) - 1):
+        length += np.linalg.norm(points[i + 1] - points[i])
+    return length
+
 
 def sample_pts_from_line(line, 
                          fixed_num=-1,
@@ -1704,3 +2899,4 @@ def sample_pts_from_line(line,
             num_valid = len(sampled_points)
 
     return sampled_points, num_valid
+

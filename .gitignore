@@ -2,6 +2,8 @@
 change_submit.py
 cluster_submit.yaml
 
+train.sh
+train*.sh
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
